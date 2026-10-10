@@ -23,14 +23,19 @@ struct FFCond
 {
 	CONDITION_VARIABLE cond = CONDITION_VARIABLE_INIT;
 	void Wait(FFMutex& m) { SleepConditionVariableSRW(&cond, &m.lock, INFINITE, 0); }
+	void WaitFor(FFMutex& m, int ms) { SleepConditionVariableSRW(&cond, &m.lock, ms, 0); }
 	void WakeAll() { WakeAllConditionVariable(&cond); }
 };
 struct FFThread
 {
 	HANDLE handle = NULL;
-	template <class T> bool Start(T* object)
+	void (*entry)(void*) = nullptr;
+	void* argument = nullptr;
+	bool Start(void (*function)(void*), void* object)
 	{
-		handle = CreateThread(NULL, 0, [](LPVOID p) -> DWORD { ((T*)p)->ThreadMain(); return 0; }, object, 0, NULL);
+		entry = function;
+		argument = object;
+		handle = CreateThread(NULL, 0, [](LPVOID p) -> DWORD { FFThread* t = (FFThread*)p; t->entry(t->argument); return 0; }, this, 0, NULL);
 		return handle != NULL;
 	}
 	void Join()
@@ -65,15 +70,28 @@ struct FFCond
 {
 	pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 	void Wait(FFMutex& m) { pthread_cond_wait(&cond, &m.lock); }
+	void WaitFor(FFMutex& m, int ms)
+	{
+		timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_nsec += (long)ms * 1000000;
+		ts.tv_sec += ts.tv_nsec / 1000000000;
+		ts.tv_nsec %= 1000000000;
+		pthread_cond_timedwait(&cond, &m.lock, &ts);
+	}
 	void WakeAll() { pthread_cond_broadcast(&cond); }
 };
 struct FFThread
 {
 	pthread_t thread;
 	bool started = false;
-	template <class T> bool Start(T* object)
+	void (*entry)(void*) = nullptr;
+	void* argument = nullptr;
+	bool Start(void (*function)(void*), void* object)
 	{
-		started = pthread_create(&thread, NULL, [](void* p) -> void* { ((T*)p)->ThreadMain(); return nullptr; }, object) == 0;
+		entry = function;
+		argument = object;
+		started = pthread_create(&thread, NULL, [](void* p) -> void* { FFThread* t = (FFThread*)p; t->entry(t->argument); return nullptr; }, this) == 0;
 		return started;
 	}
 	void Join()
@@ -106,8 +124,12 @@ struct AudioSink
 {
 	static const int SAMPLE_RATE = 48000;
 	static const int CHANNELS = 2;
-	// Interleaved signed 16-bit stereo at SAMPLE_RATE. May block briefly when full.
+	// Interleaved signed 16-bit stereo at SAMPLE_RATE. May block briefly while playing and full.
 	virtual void Write(const int16_t* samples, int frames) = 0;
+	// Audio accepted but not yet played, in seconds.
+	virtual double BufferedSeconds() = 0;
+	// No more audio will be written.
+	virtual void EndOfStream() {}
 	virtual ~AudioSink() {}
 };
 
@@ -131,6 +153,9 @@ public:
 	bool hasAudio = false;
 	std::string error;
 
+	// Statistics
+	volatile long framesShown = 0, framesSkipped = 0, keyframeJumps = 0;
+
 	MovieDecoder(FFLib& ff, AudioSink* audio) : ff(ff), audioSink(audio) {}
 
 	~MovieDecoder()
@@ -138,7 +163,12 @@ public:
 		Stop();
 		for (auto& f : queue)
 			free(f.pixels);
+		while (fifoCount > 0)
+			PopPacket();
+		if (pendingVideo)
+			ff.av_packet_free(&pendingVideo);
 		if (frame) ff.av_frame_free(&frame);
+		if (audioFrame) ff.av_frame_free(&audioFrame);
 		if (packet) ff.av_packet_free(&packet);
 		if (sws) ff.sws_freeContext(sws);
 		if (swr) ff.swr_free(&swr);
@@ -190,15 +220,19 @@ public:
 			duration = stream->duration * timeBase;
 
 		frame = ff.av_frame_alloc();
+		audioFrame = ff.av_frame_alloc();
 		packet = ff.av_packet_alloc();
-		if (!frame || !packet)
+		if (!frame || !audioFrame || !packet)
 			return Fail("out of memory", 0);
 
 		// Preroll: decode until the first video frame is queued
-		capacity = hasAudio ? 16 : 6;
 		while (count == 0 && !eof)
-			if (!Step())
-				break;
+		{
+			bool progress = DemuxOnce();
+			progress |= VideoOnce();
+			if (!progress && demuxDone && !eof)
+				break; // nothing decodable
+		}
 		if (count == 0)
 		{
 			if (error.empty())
@@ -208,10 +242,12 @@ public:
 		return true;
 	}
 
+	// Starts the demux/audio thread and the video decoding thread.
 	void Start()
 	{
 		stopping = false;
-		thread.Start(this);
+		demuxThread.Start([](void* p) { ((MovieDecoder*)p)->DemuxMain(); }, this);
+		videoThread.Start([](void* p) { ((MovieDecoder*)p)->VideoMain(); }, this);
 	}
 
 	void Stop()
@@ -221,7 +257,8 @@ public:
 			stopping = true;
 			cond.WakeAll();
 		}
-		thread.Join();
+		demuxThread.Join();
+		videoThread.Join();
 	}
 
 	// Picks the frame to show at time t (seconds). Returns the frame and whether it
@@ -229,10 +266,12 @@ public:
 	const Frame* FrameFor(double t, bool* changed)
 	{
 		FFLockGuard guard(mutex);
+		requestedTime = t;
+		consumerStarted = true;
 		bool popped = false;
-		while (count >= 2 && queue[(head + 1) % capacity].pts <= t)
+		while (count >= 2 && queue[(head + 1) % CAPACITY].pts <= t)
 		{
-			head = (head + 1) % capacity;
+			head = (head + 1) % CAPACITY;
 			count--;
 			popped = true;
 		}
@@ -241,8 +280,11 @@ public:
 		if (count == 0)
 			return nullptr;
 		const Frame* f = &queue[head];
+		bool isNew = (f != lastShown) || popped || !shownOnce;
+		if (isNew)
+			framesShown++;
 		if (changed)
-			*changed = (f != lastShown) || popped || !shownOnce;
+			*changed = isNew;
 		lastShown = f;
 		shownOnce = true;
 		return f;
@@ -268,32 +310,60 @@ public:
 		return lastPts + lastDuration;
 	}
 
-	// Worker thread
-	void ThreadMain()
+	// Reads the file and decodes audio. Audio is cheap, so it always stays ahead
+	// regardless of how long video frames take to decode.
+	void DemuxMain()
 	{
 		for (;;)
 		{
 			{
 				FFLockGuard guard(mutex);
-				while (!stopping && count >= capacity)
-					cond.Wait(mutex);
+				if (stopping || demuxDone)
+					return;
+			}
+			if (!DemuxOnce())
+			{
+				FFLockGuard guard(mutex);
+				if (!stopping)
+					cond.WaitFor(mutex, 5); // poll for audio consumption / room in the packet queue
+			}
+		}
+	}
+
+	// Decodes video packets and converts frames into the queue.
+	void VideoMain()
+	{
+		for (;;)
+		{
+			{
+				FFLockGuard guard(mutex);
 				if (stopping || eof)
 					return;
 			}
-			if (!Step())
-				return;
+			if (!VideoOnce())
+			{
+				FFLockGuard guard(mutex);
+				if (!stopping && !eof)
+					cond.WaitFor(mutex, 5);
+			}
 		}
 	}
 
 private:
+	static const int CAPACITY = 6;              // decoded video frames
+	static const int FIFO_MAX = 2048;           // compressed video packets waiting for the decoder
+	static const int MIN_VIDEO_PACKETS = 8;     // keep at least this many queued for the video thread
+	static constexpr double AUDIO_AHEAD = 1.0;  // seconds of audio to keep buffered
+
 	FFLib& ff;
 	AudioSink* audioSink;
 
 	AVFormatContext* format = nullptr;
 	AVCodecContext* videoCodec = nullptr;
 	AVCodecContext* audioCodec = nullptr;
-	AVFrame* frame = nullptr;
-	AVPacket* packet = nullptr;
+	AVFrame* frame = nullptr;       // video thread
+	AVFrame* audioFrame = nullptr;  // demux thread
+	AVPacket* packet = nullptr;     // demux thread
 	SwsContext* sws = nullptr;
 	SwrContext* swr = nullptr;
 	int16_t* audioBuffer = nullptr;
@@ -302,22 +372,28 @@ private:
 	int videoIndex = -1, audioIndex = -1;
 	double timeBase = 0.0, startTime = -1.0;
 	double lastPts = -1.0, lastDuration = 0.0;
+
+	// Demuxed video packets not yet given to the video decoder (guarded by mutex)
+	AVPacket* fifo[FIFO_MAX] = {};
+	int fifoHead = 0, fifoCount = 0;
 	bool demuxDone = false;
-	bool packetPending = false;
-	bool flushPending = false;
+	bool flushSent = false;
 	bool videoFlushed = false;
 
 	FFMutex mutex;
 	FFCond cond;
-	FFThread thread;
+	FFThread demuxThread, videoThread;
+	AVPacket* pendingVideo = nullptr; // packet the video decoder refused (video thread only)
+	bool reducedQuality = false;      // video thread only
 	bool stopping = false;
 	bool eof = false;
 
-	static const int MAX_CAPACITY = 16;
-	Frame queue[MAX_CAPACITY];
-	int capacity = 6, head = 0, count = 0;
+	Frame queue[CAPACITY];
+	int head = 0, count = 0;
 	const Frame* lastShown = nullptr;
 	bool shownOnce = false;
+	bool consumerStarted = false;
+	double requestedTime = 0.0;
 
 	bool Fail(const char* what, int code)
 	{
@@ -348,98 +424,230 @@ private:
 		return true;
 	}
 
-	// Reads and decodes one packet (or drains at end). Returns false on fatal error.
-	bool Step()
+	void PopPacket()
 	{
-		if (!demuxDone && !packetPending)
-		{
-			if (ff.av_read_frame(format, packet) < 0)
-			{
-				demuxDone = true;
-				flushPending = true;
-				if (audioCodec)
-					ff.avcodec_send_packet(audioCodec, nullptr);
-			}
-			else
-				packetPending = true;
-		}
+		ff.av_packet_free(&fifo[fifoHead]);
+		fifoHead = (fifoHead + 1) % FIFO_MAX;
+		fifoCount--;
+	}
 
-		// A decoder returns EAGAIN while its output is undrained (our queue was full);
-		// keep the packet and retry after the queue has room again.
-		if (packetPending)
-		{
-			if (packet->stream_index == videoIndex)
-			{
-				if (ff.avcodec_send_packet(videoCodec, packet) != AVERROR(EAGAIN))
-				{
-					ff.av_packet_unref(packet);
-					packetPending = false;
-				}
-			}
-			else
-			{
-				if (packet->stream_index == audioIndex)
-				{
-					if (ff.avcodec_send_packet(audioCodec, packet) == AVERROR(EAGAIN))
-					{
-						ReceiveAudio();
-						ff.avcodec_send_packet(audioCodec, packet);
-					}
-				}
-				ff.av_packet_unref(packet);
-				packetPending = false;
-			}
-		}
-		if (flushPending && ff.avcodec_send_packet(videoCodec, nullptr) != AVERROR(EAGAIN))
-			flushPending = false;
+	bool QueueFull()
+	{
+		FFLockGuard guard(mutex);
+		return count >= CAPACITY;
+	}
 
-		if (!ReceiveVideo())
+	// Read further while audio needs data or the video decoder is short of packets.
+	bool CanDemux()
+	{
+		if (demuxDone)
 			return false;
-		if (audioCodec)
-			ReceiveAudio();
-
-		if (demuxDone && videoFlushed)
+		int packets;
 		{
 			FFLockGuard guard(mutex);
-			eof = true;
+			packets = fifoCount;
+		}
+		if (packets >= FIFO_MAX)
+			return false;
+		if (packets < MIN_VIDEO_PACKETS)
+			return true;
+		return hasAudio && audioSink->BufferedSeconds() < AUDIO_AHEAD;
+	}
+
+	// Demux thread: reads one packet. Returns false when it chose not to read.
+	bool DemuxOnce()
+	{
+		if (!CanDemux())
+			return false;
+
+		if (ff.av_read_frame(format, packet) < 0)
+		{
+			if (audioCodec)
+			{
+				ff.avcodec_send_packet(audioCodec, nullptr);
+				ReceiveAudio();
+			}
+			if (audioSink && hasAudio)
+				audioSink->EndOfStream();
+			FFLockGuard guard(mutex);
+			demuxDone = true;
 			cond.WakeAll();
+			return true;
+		}
+
+		if (packet->stream_index == videoIndex)
+		{
+			AVPacket* copy = ff.av_packet_alloc();
+			if (copy)
+			{
+				ff.av_packet_move_ref(copy, packet); // keeps the reference-counted data
+				FFLockGuard guard(mutex);
+				fifo[(fifoHead + fifoCount) % FIFO_MAX] = copy;
+				fifoCount++;
+				cond.WakeAll();
+			}
+			else
+				ff.av_packet_unref(packet);
+		}
+		else
+		{
+			if (packet->stream_index == audioIndex)
+			{
+				if (ff.avcodec_send_packet(audioCodec, packet) == AVERROR(EAGAIN))
+				{
+					ReceiveAudio();
+					ff.avcodec_send_packet(audioCodec, packet);
+				}
+				ReceiveAudio();
+			}
+			ff.av_packet_unref(packet);
 		}
 		return true;
 	}
 
-	bool ReceiveVideo()
+	double PacketSeconds(const AVPacket* p)
 	{
+		int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
+		if (ts == AV_NOPTS_VALUE)
+			return -1.0;
+		return ts * timeBase - (startTime > 0.0 ? startTime : 0.0);
+	}
+
+	// When decoding cannot keep up with playback: first make the decoder cheaper,
+	// and if that is not enough, jump to the next keyframe.
+	void CatchUp()
+	{
+		double now, behind;
+		{
+			FFLockGuard guard(mutex);
+			if (!consumerStarted || lastPts < 0.0)
+				return;
+			now = requestedTime;
+			behind = now - lastPts;
+		}
+
+		bool skip = behind > 0.15;
+		if (skip != reducedQuality)
+		{
+			reducedQuality = skip;
+			ff.av_opt_set(videoCodec, "skip_frame", skip ? "noref" : "default", 0);
+			ff.av_opt_set(videoCodec, "skip_loop_filter", skip ? "all" : "default", 0);
+		}
+
+		if (behind < 0.5)
+			return;
+
+		// Find the newest queued keyframe that is not in the future
+		FFLockGuard guard(mutex);
+		int target = -1;
+		for (int i = 0; i < fifoCount; i++)
+		{
+			const AVPacket* p = fifo[(fifoHead + i) % FIFO_MAX];
+			if (!(p->flags & AV_PKT_FLAG_KEY))
+				continue;
+			double t = PacketSeconds(p);
+			if (t >= 0.0 && t <= now + 0.1)
+				target = i;
+		}
+		if (target <= 0)
+			return;
+		for (int i = 0; i < target; i++)
+		{
+			ff.av_packet_free(&fifo[fifoHead]);
+			fifoHead = (fifoHead + 1) % FIFO_MAX;
+			fifoCount--;
+		}
+		if (pendingVideo)
+			ff.av_packet_free(&pendingVideo);
+		ff.avcodec_flush_buffers(videoCodec);
+		keyframeJumps++;
+		cond.WakeAll();
+	}
+
+	// Video thread: feeds packets to the decoder and collects frames. Returns false when idle.
+	bool VideoOnce()
+	{
+		bool progress = false;
+		if (!flushSent)
+			CatchUp();
 		for (;;)
 		{
+			if (!pendingVideo)
 			{
 				FFLockGuard guard(mutex);
-				if (count >= capacity || stopping)
-					return true; // leave remaining frames in the decoder for later
+				if (fifoCount == 0)
+					break;
+				pendingVideo = fifo[fifoHead];
+				fifo[fifoHead] = nullptr;
+				fifoHead = (fifoHead + 1) % FIFO_MAX;
+				fifoCount--;
+				cond.WakeAll(); // room for the demuxer
 			}
+			if (ff.avcodec_send_packet(videoCodec, pendingVideo) == AVERROR(EAGAIN))
+				break; // decoder output must be drained first
+			ff.av_packet_free(&pendingVideo);
+			progress = true;
+			if (ReceiveVideo())
+				break; // a frame came out: let the queue logic run
+		}
+
+		bool finishedInput;
+		{
+			FFLockGuard guard(mutex);
+			finishedInput = demuxDone && fifoCount == 0 && !pendingVideo;
+		}
+		if (finishedInput && !flushSent)
+		{
+			if (ff.avcodec_send_packet(videoCodec, nullptr) != AVERROR(EAGAIN))
+				flushSent = true;
+			progress = true;
+		}
+
+		if (ReceiveVideo())
+			progress = true;
+
+		if (finishedInput && videoFlushed)
+		{
+			FFLockGuard guard(mutex);
+			eof = true;
+			cond.WakeAll();
+			progress = true;
+		}
+		return progress;
+	}
+
+	// Returns true if any frame was received.
+	bool ReceiveVideo()
+	{
+		bool received = false;
+		while (!videoFlushed)
+		{
+			if (QueueFull())
+				break; // leave remaining frames in the decoder for later
 			int r = ff.avcodec_receive_frame(videoCodec, frame);
 			if (r == AVERROR(EAGAIN))
-				return true;
+				break;
 			if (r == AVERROR_EOF)
 			{
 				videoFlushed = true;
-				return true;
+				break;
 			}
 			if (r < 0)
-			{
-				// Corrupt data: skip it and keep going
-				continue;
-			}
-			bool ok = QueueVideoFrame();
+				continue; // corrupt data: skip it
+			received = true;
+#ifdef FFMOVIE_TEST_DECODE_DELAY_US
+			usleep(FFMOVIE_TEST_DECODE_DELAY_US); // test hook: simulate a slow CPU
+#endif
+			QueueVideoFrame();
 			ff.av_frame_unref(frame);
-			if (!ok)
-				return false;
 		}
+		return received;
 	}
 
-	bool QueueVideoFrame()
+	void QueueVideoFrame()
 	{
-		if (frame->width <= 0 || frame->height <= 0)
-			return true;
+		if (frame->width <= 0 || frame->height <= 0 || !frame->data[0])
+			return;
 		if (width == 0)
 		{
 			width = frame->width;
@@ -463,10 +671,25 @@ private:
 			pts = 0.0;
 		double frameDuration = 1.0 / fps;
 
+		// If decoding has fallen behind playback, skip converting frames that are
+		// already late (the consumer would drop them anyway).
+		{
+			FFLockGuard guard(mutex);
+			// count includes the frame on screen; only skip when another newer frame is already waiting
+			bool late = consumerStarted && count >= 2 && pts + 2 * frameDuration < requestedTime;
+			lastPts = pts;
+			lastDuration = frameDuration;
+			if (late)
+			{
+				framesSkipped++;
+				return;
+			}
+		}
+
 		sws = ff.sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
 			width, height, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
 		if (!sws)
-			return Fail("sws_getCachedContext", 0);
+			return;
 
 		// Colour matrix: honour the stream's tags, defaulting to BT.709 for HD
 		int colorspace = frame->colorspace;
@@ -480,13 +703,13 @@ private:
 		Frame* slot;
 		{
 			FFLockGuard guard(mutex);
-			slot = &queue[(head + count) % capacity];
+			slot = &queue[(head + count) % CAPACITY];
 		}
 		if (!slot->pixels)
 		{
 			slot->pixels = (uint8_t*)malloc((size_t)width * height * 4);
 			if (!slot->pixels)
-				return Fail("out of memory", 0);
+				return;
 		}
 
 		uint8_t* dst[4] = { slot->pixels, nullptr, nullptr, nullptr };
@@ -496,21 +719,18 @@ private:
 		slot->duration = frameDuration;
 
 		FFLockGuard guard(mutex);
-		lastPts = pts;
-		lastDuration = frameDuration;
 		count++;
-		return true;
 	}
 
 	void ReceiveAudio()
 	{
 		for (;;)
 		{
-			int r = ff.avcodec_receive_frame(audioCodec, frame);
+			int r = ff.avcodec_receive_frame(audioCodec, audioFrame);
 			if (r < 0)
 				return;
 			WriteAudioFrame();
-			ff.av_frame_unref(frame);
+			ff.av_frame_unref(audioFrame);
 		}
 	}
 
@@ -521,7 +741,7 @@ private:
 			AVChannelLayout outLayout;
 			ff.av_channel_layout_default(&outLayout, AudioSink::CHANNELS);
 			int r = ff.swr_alloc_set_opts2(&swr, &outLayout, AV_SAMPLE_FMT_S16, AudioSink::SAMPLE_RATE,
-				&frame->ch_layout, (AVSampleFormat)frame->format, frame->sample_rate, 0, nullptr);
+				&audioFrame->ch_layout, (AVSampleFormat)audioFrame->format, audioFrame->sample_rate, 0, nullptr);
 			ff.av_channel_layout_uninit(&outLayout);
 			if (r < 0 || ff.swr_init(swr) < 0)
 			{
@@ -531,7 +751,7 @@ private:
 			}
 		}
 
-		int outFrames = ff.swr_get_out_samples(swr, frame->nb_samples);
+		int outFrames = ff.swr_get_out_samples(swr, audioFrame->nb_samples);
 		if (outFrames <= 0)
 			return;
 		if (outFrames > audioBufferFrames)
@@ -543,7 +763,7 @@ private:
 				return;
 		}
 		uint8_t* out[1] = { (uint8_t*)audioBuffer };
-		int converted = ff.swr_convert(swr, out, outFrames, (const uint8_t**)frame->extended_data, frame->nb_samples);
+		int converted = ff.swr_convert(swr, out, outFrames, (const uint8_t**)audioFrame->extended_data, audioFrame->nb_samples);
 		if (converted > 0)
 			audioSink->Write(audioBuffer, converted);
 	}

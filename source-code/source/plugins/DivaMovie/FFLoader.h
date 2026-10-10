@@ -56,6 +56,8 @@ typedef void* FFLibHandle;
 	X(avcodec, av_packet_alloc) \
 	X(avcodec, av_packet_free) \
 	X(avcodec, av_packet_unref) \
+	X(avcodec, av_packet_move_ref) \
+	X(avcodec, avcodec_flush_buffers) \
 	X(avformat, avformat_version) \
 	X(avformat, avformat_open_input) \
 	X(avformat, avformat_find_stream_info) \

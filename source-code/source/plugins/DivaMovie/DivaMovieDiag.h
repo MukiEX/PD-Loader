@@ -60,7 +60,7 @@ namespace Diag
 		HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
 		typedef const char* (__cdecl* PFN_wine_get_version)(void);
 		PFN_wine_get_version wineVersion = ntdll ? (PFN_wine_get_version)GetProcAddress(ntdll, "wine_get_version") : NULL;
-		PRINT("[DivaMovie] Loaded (interop emulation build). Wine: %s\n", wineVersion ? wineVersion() : "no");
+		PRINT("[DivaMovie] Loaded (FFmpeg player build 2). Wine: %s\n", wineVersion ? wineVersion() : "no");
 
 		HMODULE d3d9 = GetModuleHandleW(L"d3d9.dll");
 		if (!d3d9)

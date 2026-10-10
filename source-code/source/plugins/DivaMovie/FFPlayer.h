@@ -89,9 +89,14 @@ namespace FFPlayer
 
 	// ---- waveOut audio (optional) ----
 
+	// Plays movie audio and serves as the master clock while it plays: the clock is
+	// the device's playback position, so stalls delay audio and video together
+	// instead of letting them drift apart.
 	class WaveOutSink : public AudioSink
 	{
 	public:
+		volatile LONG underruns = 0;
+
 		bool Open()
 		{
 			WAVEFORMATEX format = {};
@@ -164,6 +169,7 @@ namespace FFPlayer
 						ring[(start + used + i) % RING] = samples[i];
 					used += n;
 					ReleaseSRWLockExclusive(&lock);
+					SetEvent(event);
 					return;
 				}
 				ReleaseSRWLockExclusive(&lock);
@@ -171,14 +177,74 @@ namespace FFPlayer
 			}
 		}
 
-		void Play() { playing = true; if (device) waveOutRestart(device); }
-		void Pause() { playing = false; if (device) waveOutPause(device); }
+		double BufferedSeconds() override
+		{
+			AcquireSRWLockShared(&lock);
+			double s = (double)(used + queuedValues) / (CHANNELS * SAMPLE_RATE);
+			ReleaseSRWLockShared(&lock);
+			return s;
+		}
+
+		void EndOfStream() override
+		{
+			ended = true;
+			SetEvent(event);
+		}
+
+		void Play()
+		{
+			AcquireSRWLockExclusive(&lock);
+			playing = true;
+			if (exhausted && !wallRunning)
+			{
+				wallStart = FFNow();
+				wallRunning = true;
+			}
+			ReleaseSRWLockExclusive(&lock);
+			if (device)
+				waveOutRestart(device);
+		}
+
+		void Pause()
+		{
+			AcquireSRWLockExclusive(&lock);
+			playing = false;
+			if (wallRunning)
+			{
+				wallBase += FFNow() - wallStart;
+				wallRunning = false;
+			}
+			ReleaseSRWLockExclusive(&lock);
+			if (device)
+				waveOutPause(device);
+		}
+
 		void Abort() { aborted = true; }
 		void SetVolume(float v) { volume = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
 
+		// True once every sample has been played.
+		bool Exhausted()
+		{
+			AcquireSRWLockShared(&lock);
+			bool e = exhausted;
+			ReleaseSRWLockShared(&lock);
+			return e;
+		}
+
+		// Seconds of audio played so far; continues on the wall clock after the audio ends.
+		double ClockSeconds()
+		{
+			AcquireSRWLockShared(&lock);
+			bool e = exhausted;
+			double base = exhaustedAt + wallBase + (wallRunning ? FFNow() - wallStart : 0.0);
+			ReleaseSRWLockShared(&lock);
+			return e ? base : PlayedSeconds();
+		}
+
 	private:
 		static const int BUFFERS = 4;
-		static const int BLOCK_FRAMES = SAMPLE_RATE / 25; // 40 ms
+		static const int BLOCK_FRAMES = SAMPLE_RATE / 50; // 20 ms
+		static const size_t BLOCK_VALUES = (size_t)BLOCK_FRAMES * CHANNELS;
 		static const size_t RING = (size_t)SAMPLE_RATE * CHANNELS * 2; // 2 s
 
 		HWAVEOUT device = NULL;
@@ -186,36 +252,100 @@ namespace FFPlayer
 		volatile bool running = false;
 		volatile bool playing = false;
 		volatile bool aborted = false;
+		volatile bool ended = false;
 		WAVEHDR headers[BUFFERS] = {};
-		int16_t blocks[BUFFERS][BLOCK_FRAMES * CHANNELS];
+		int16_t blocks[BUFFERS][BLOCK_VALUES];
 		SRWLOCK lock = SRWLOCK_INIT;
 		int16_t ring[RING];
 		size_t start = 0, used = 0;
+		size_t queuedValues = 0;           // handed to the device, not yet played
 		volatile float volume = 1.0f;
+
+		bool exhausted = false;
+		double exhaustedAt = 0.0;          // audio clock when the last sample played
+		double wallBase = 0.0, wallStart = 0.0;
+		bool wallRunning = false;
+
+		double PlayedSeconds()
+		{
+			MMTIME position = {};
+			position.wType = TIME_SAMPLES;
+			if (!device || waveOutGetPosition(device, &position, sizeof(position)) != MMSYSERR_NOERROR)
+				return 0.0;
+			if (position.wType == TIME_SAMPLES)
+				return position.u.sample / (double)SAMPLE_RATE;
+			if (position.wType == TIME_BYTES)
+				return position.u.cb / (double)(SAMPLE_RATE * CHANNELS * 2);
+			return 0.0;
+		}
 
 		void Feed()
 		{
+			bool starved = false;
 			while (running)
 			{
+				int queued = 0;
 				for (int i = 0; i < BUFFERS && running; i++)
 				{
 					if (!(headers[i].dwFlags & WHDR_DONE))
+					{
+						queued++;
 						continue;
-					int16_t* block = blocks[i];
-					size_t values = BLOCK_FRAMES * CHANNELS;
+					}
+					if (headers[i].dwUser)
+					{
+						// finished playing
+						AcquireSRWLockExclusive(&lock);
+						queuedValues -= headers[i].dwUser;
+						ReleaseSRWLockExclusive(&lock);
+						headers[i].dwUser = 0;
+					}
+
 					AcquireSRWLockExclusive(&lock);
-					size_t n = used < values ? used : values;
+					// Never pad with silence mid-stream: wait for a full block so the
+					// device clock simply pauses during a stall.
+					size_t n = used < BLOCK_VALUES ? used : BLOCK_VALUES;
+					if (n < BLOCK_VALUES && !ended)
+						n = 0;
 					float v = volume;
+					int16_t* block = blocks[i];
 					for (size_t k = 0; k < n; k++)
 						block[k] = (int16_t)(ring[(start + k) % RING] * v);
 					start = (start + n) % RING;
 					used -= n;
+					queuedValues += n;
 					ReleaseSRWLockExclusive(&lock);
-					memset(block + n, 0, (values - n) * sizeof(int16_t)); // underrun: silence
+					if (n == 0)
+						continue;
+
+					headers[i].dwBufferLength = (DWORD)(n * sizeof(int16_t));
+					headers[i].dwUser = n;
 					headers[i].dwFlags &= ~WHDR_DONE;
 					waveOutWrite(device, &headers[i], sizeof(WAVEHDR));
+					queued++;
 				}
-				WaitForSingleObject(event, 100);
+
+				AcquireSRWLockExclusive(&lock);
+				if (queued == 0 && playing && !exhausted)
+				{
+					if (ended && used == 0)
+					{
+						exhausted = true;
+						exhaustedAt = PlayedSeconds();
+						wallStart = FFNow();
+						wallRunning = true;
+					}
+					else if (!starved)
+					{
+						InterlockedIncrement(&underruns);
+						starved = true;
+					}
+				}
+				else if (queued > 0)
+					starved = false;
+				ReleaseSRWLockExclusive(&lock);
+
+				WaitForSingleObject(event, 20);
 			}
 		}
 	};
@@ -333,6 +463,7 @@ namespace FFPlayer
 		bool clockRunning = false;
 		float volume = 1.0f;
 		bool loggedFirstUpload = false;
+		bool audioStarted = false;
 
 		static const PlayerVtbl vtable;
 
@@ -347,6 +478,8 @@ namespace FFPlayer
 				INT64 ticks = ((PFN_GetTime)(*(void***)clock)[6])(clock);
 				return ticks * 1e-7;
 			}
+			if (audio && audioStarted)
+				return audio->ClockSeconds(); // movie audio is the master clock
 			return clockBase + (clockRunning ? FFNow() - playStart : 0.0);
 		}
 
@@ -515,14 +648,17 @@ namespace FFPlayer
 			if (s == STATE_PLAYING)
 			{
 				AcquireSRWLockShared(&self->lock);
-				bool finished = self->decoder && self->decoder->Finished(self->Now());
+				bool finished = self->decoder && self->decoder->Finished(self->Now()) &&
+					(!self->audioStarted || self->audio->Exhausted());
+				if (finished && InterlockedCompareExchange(&self->state, STATE_STOPPED, STATE_PLAYING) == STATE_PLAYING)
+				{
+					PRINT("[DivaMovie] FFmpeg player: finished %s (frames shown %ld, conversions skipped %ld, keyframe jumps %ld, audio underruns %ld)\n",
+						self->path.c_str(), self->decoder->framesShown, self->decoder->framesSkipped, self->decoder->keyframeJumps,
+						self->audio ? self->audio->underruns : 0L);
+				}
 				ReleaseSRWLockShared(&self->lock);
 				if (finished)
-				{
-					InterlockedCompareExchange(&self->state, STATE_STOPPED, STATE_PLAYING);
-					PRINT("[DivaMovie] FFmpeg player: finished %s\n", self->path.c_str());
 					s = STATE_STOPPED;
-				}
 			}
 			return s;
 		}
@@ -539,7 +675,10 @@ namespace FFPlayer
 			}
 			// Movie audio only when the video is not slaved to the song
 			if (self->audio && !self->clock)
+			{
 				self->audio->Play();
+				self->audioStarted = true;
+			}
 			InterlockedExchange(&self->state, STATE_PLAYING);
 			return S_OK;
 		}
