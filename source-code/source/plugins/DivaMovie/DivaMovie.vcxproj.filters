@@ -6,6 +6,10 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="GLDXInteropEmu.h" />
+    <ClInclude Include="DivaMovieDiag.h" />
+    <ClInclude Include="FFLoader.h" />
+    <ClInclude Include="FFMovie.h" />
+    <ClInclude Include="FFPlayer.h" />
     <ClInclude Include="PluginConfigApi.h" />
   </ItemGroup>
 </Project>

@@ -25,7 +25,12 @@ LPCWSTR CONFIG_FILE = CONFIG_FILE_STRING.c_str();
 std::wstring MASTER_CONFIG_FILE_STRING = DirPath() + L"\\plugins\\config.ini";
 LPCWSTR MASTER_CONFIG_FILE = MASTER_CONFIG_FILE_STRING.c_str();
 
-#define PRINT(value, ...) if (debug) printf(value, __VA_ARGS__);
+std::wstring LOG_FILE_STRING = DirPath() + L"\\plugins\\DivaMovie.log";
+
+// Writes to the console and to plugins\DivaMovie.log (defined in dllmain.cpp)
+void LogPrint(const char* format, ...);
+
+#define PRINT(value, ...) if (debug) LogPrint(value, __VA_ARGS__);
 
 #define PROC_ADDRESS(libraryName, procName) \
 	GetProcAddress(LoadLibrary(TEXT(libraryName)), procName)

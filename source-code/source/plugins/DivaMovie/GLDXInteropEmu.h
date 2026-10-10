@@ -345,6 +345,10 @@ namespace GLDXEmu
 	{
 		if (!hObjects)
 			return FALSE;
+		static LONG lockCount = 0;
+		LONG n = InterlockedIncrement(&lockCount);
+		if (n <= 3 || n % 600 == 0)
+			PRINT("[DivaMovie] Interop emulation: lock #%ld (%d object(s))\n", n, count);
 		for (GLint i = 0; i < count; i++)
 		{
 			EmuObject* obj = (EmuObject*)hObjects[i];
@@ -371,7 +375,8 @@ namespace GLDXEmu
 			&& memcmp(EXPECTED_NAME, "wglDXOpenDeviceNV", sizeof("wglDXOpenDeviceNV")) == 0;
 	}
 
-	inline bool Install()
+	// Resolves the OpenGL 1.1 entry points used for uploads (shared with the FFmpeg player).
+	inline bool LoadGL()
 	{
 		HMODULE gl = GetModuleHandleW(L"opengl32.dll");
 		if (!gl)
@@ -386,17 +391,24 @@ namespace GLDXEmu
 		pglGetIntegerv = (PFN_glGetIntegerv)GetProcAddress(gl, "glGetIntegerv");
 		pglPixelStorei = (PFN_glPixelStorei)GetProcAddress(gl, "glPixelStorei");
 		pglGetError = (PFN_glGetError)GetProcAddress(gl, "glGetError");
+		ResolveOptionalGL();
+		return pglBindTexture && pglTexImage2D && pglTexSubImage2D && pglTexParameteri && pglGetIntegerv &&
+			pglPixelStorei && pglGetError;
+	}
+
+	inline bool Install()
+	{
+		if (!LoadGL())
+			return false;
+		HMODULE gl = GetModuleHandleW(L"opengl32.dll");
 
 		void* getProcAddress = (void*)GetProcAddress(gl, "wglGetProcAddress");
 		void* getCurrentContext = (void*)GetProcAddress(gl, "wglGetCurrentContext");
 		void* deleteTextures = (void*)GetProcAddress(gl, "glDeleteTextures");
 		void* genTextures = (void*)GetProcAddress(gl, "glGenTextures");
 
-		if (!pglBindTexture || !pglTexImage2D || !pglTexSubImage2D || !pglTexParameteri || !pglGetIntegerv ||
-			!pglPixelStorei || !pglGetError || !getProcAddress || !getCurrentContext || !deleteTextures || !genTextures)
+		if (!getProcAddress || !getCurrentContext || !deleteTextures || !genTextures)
 			return false;
-
-		ResolveOptionalGL();
 
 		// The game resolves glDeleteTextures/glGenTextures through wglGetProcAddress, which is
 		// not required to return OpenGL 1.1 functions (Wine returns NULL), so take them from

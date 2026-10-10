@@ -14,8 +14,11 @@
 
 bool forceSoftwareDecoding = false, forceHybridDecoding = false, debug = false;
 bool forceInteropEmulation = false, disableInteropEmulation = false;
+bool useFFmpegPlayer = true;
 
 #include "GLDXInteropEmu.h"
+#include "DivaMovieDiag.h"
+#include "FFPlayer.h"
 
 IDirect3DDeviceManager9* deviceManager;
 
@@ -221,6 +224,8 @@ VTABLE_HOOK(HRESULT, IMFTransform, ProcessMessage, MFT_MESSAGE_TYPE eMessage, UL
 	else
 	{
 		HRESULT result = originalProcessMessage(This, eMessage, ulParam);
+		if (eMessage == MFT_MESSAGE_SET_D3D_MANAGER)
+			PRINT("[DivaMovie] Decoder SET_D3D_MANAGER(%p): 0x%08x\n", (void*)ulParam, (unsigned int)result);
 		if (eMessage == MFT_MESSAGE_SET_D3D_MANAGER && result == MF_E_UNSUPPORTED_D3D_TYPE)
 		{
 			PRINT("[DivaMovie] This system does not support DXVA hardware decoding\n");
@@ -260,6 +265,7 @@ VTABLE_HOOK(HRESULT, IMFTransform, ProcessMessage, MFT_MESSAGE_TYPE eMessage, UL
 HOOK(void*, IMFTransformInitializer, 0x140420B90, void* a1, void* a2, IMFTransform** transform)
 {
 	void* result = originalIMFTransformInitializer(a1, a2, transform);
+	PRINT("[DivaMovie] Video decoder created: %p\n", transform ? (void*)*transform : NULL);
 	INSTALL_VTABLE_HOOK(*transform, ProcessMessage, 23);
 	return result;
 }
@@ -278,6 +284,9 @@ HOOK(HRESULT, DXVA2CreateDirect3DDeviceManager, PROC_ADDRESS("dxva2.dll", "DXVA2
 	deviceManager = *ppDeviceManager;
 	deviceManager->AddRef();
 
+	PRINT("[DivaMovie] D3D device manager created\n");
+	Diag::HookDeviceManager(deviceManager);
+
 	return result;
 }
 
@@ -285,6 +294,7 @@ HOOK(HRESULT, DXVA2CreateDirect3DDeviceManager, PROC_ADDRESS("dxva2.dll", "DXVA2
 // extension is unavailable (Wine) or when emulation is forced.
 HOOK(bool, GLDXInteropLoad, GLDXEmu::ADDR_LOADER)
 {
+	PRINT("[DivaMovie] Movie interop loader called (GL context %p)\n", (void*)wglGetCurrentContext());
 	if (*GLDXEmu::loadedFlag)
 		return true;
 
@@ -314,11 +324,26 @@ HOOK(bool, GLDXInteropLoad, GLDXEmu::ADDR_LOADER)
 	return false;
 }
 
+// The game's movie player factory. Replaced by the FFmpeg player when the FFmpeg
+// libraries are available next to the plugin; otherwise the original player is used.
+HOOK(HRESULT, CreatePlayer, FFPlayer::ADDR_CREATE_PLAYER, void** player)
+{
+	if (useFFmpegPlayer && player && FFPlayer::EnsureFFmpeg())
+	{
+		*player = new FFPlayer::Player();
+		PRINT("[DivaMovie] FFmpeg player created\n");
+		return S_OK;
+	}
+	return originalCreatePlayer(player);
+}
+
 void loadConfig() {
 	forceSoftwareDecoding = GetPrivateProfileIntW(L"general", L"force_software_decoding", 0, CONFIG_FILE) > 0 ? true : false;
 	forceHybridDecoding = GetPrivateProfileIntW(L"general", L"force_hybrid_decoding", 0, CONFIG_FILE) > 0 ? true : false;
 	forceInteropEmulation = GetPrivateProfileIntW(L"general", L"force_interop_emulation", 0, CONFIG_FILE) > 0 ? true : false;
 	disableInteropEmulation = GetPrivateProfileIntW(L"general", L"disable_interop_emulation", 0, CONFIG_FILE) > 0 ? true : false;
+	useFFmpegPlayer = GetPrivateProfileIntW(L"general", L"ffmpeg_player", 1, CONFIG_FILE) > 0 ? true : false;
+	FFPlayer::movieAudio = GetPrivateProfileIntW(L"general", L"movie_audio", 0, CONFIG_FILE) > 0 ? true : false;
 	debug = GetPrivateProfileIntW(L"general", L"debug", 0, CONFIG_FILE) > 0 ? true : false;
 }
 
@@ -327,10 +352,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 	if (ul_reason_for_call == DLL_PROCESS_ATTACH)
 	{
 		loadConfig();
+		Diag::LogEnvironment();
+		Diag::InstallTracing();
 		INSTALL_HOOK(DXVA2CreateDirect3DDeviceManager);
 		INSTALL_HOOK(IMFTransformInitializer);
 
 		// Check before hooking: Detours overwrites the bytes being checked.
+		if (useFFmpegPlayer)
+		{
+			if (FFPlayer::IsSupportedExecutable())
+				INSTALL_HOOK(CreatePlayer)
+			else
+				PRINT("[DivaMovie] Unrecognised movie player code; FFmpeg player unavailable\n");
+		}
 		if (GLDXEmu::IsSupportedExecutable())
 			INSTALL_HOOK(GLDXInteropLoad)
 		else
@@ -341,6 +375,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 }
 
 PluginConfig::PluginConfigOption config[] = {
+	{ PluginConfig::CONFIG_BOOLEAN, new PluginConfig::PluginConfigBooleanData{ L"ffmpeg_player", L"general", CONFIG_FILE, L"FFmpeg Movie Player", L"Play movies with FFmpeg instead of Media Foundation (needs the FFmpeg DLLs in the plugins folder).\nWorks under Wine/Proton and supports WMV and MP4 movies.", true } },
+	{ PluginConfig::CONFIG_BOOLEAN, new PluginConfig::PluginConfigBooleanData{ L"movie_audio", L"general", CONFIG_FILE, L"Movie Audio", L"Play audio tracks of movies (FFmpeg player only).\nNever plays during songs, where the video follows the song.", false } },
 	{ PluginConfig::CONFIG_BOOLEAN, new PluginConfig::PluginConfigBooleanData{ L"force_software_decoding", L"general", CONFIG_FILE, L"Force Software Decoding", L"Use software decoding even on systems that support DXVA hardware decoding.", false } },
 	{ PluginConfig::CONFIG_BOOLEAN, new PluginConfig::PluginConfigBooleanData{ L"force_hybrid_decoding", L"general", CONFIG_FILE, L"Force Hybrid Decoding", L"Do not disable DivaMovie on systems that support DXVA hardware decoding.\nCan cause issues on recent drivers.", false } },
 	{ PluginConfig::CONFIG_BOOLEAN, new PluginConfig::PluginConfigBooleanData{ L"force_interop_emulation", L"general", CONFIG_FILE, L"Force Interop Emulation", L"Copy movie frames from Direct3D to OpenGL through system memory even if the driver supports WGL_NV_DX_interop.\nEmulation is used automatically when the extension is missing (e.g. Wine).", false } },
